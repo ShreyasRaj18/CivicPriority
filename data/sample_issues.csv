@@ -1,0 +1,10 @@
+
+issue_id,issue_type,location,severity,population_affected,recurrence,duration_days,geographic_importance,estimated_cost,crew_required,equipment_required
+I001,Damaged Road,Sector 5,5,1800,4,12,4,80000,4,1
+I002,Broken Streetlight,Sector 8,3,500,2,5,3,10000,2,1
+I003,Overflowing Drain,Sector 12,4,1200,5,8,4,30000,3,1
+I004,Water Leak,Sector 3,4,900,3,3,3,25000,2,2
+I005,Waste Accumulation,Sector 7,2,350,4,6,2,8000,2,1
+I006,Damaged Road,Sector 2,4,1500,3,15,5,60000,3,2
+I007,Broken Streetlight,Sector 10,2,200,1,2,2,7000,1,1
+I008,Overflowing Drain,Sector 4,5,2200,4,10,5,45000,4,2
