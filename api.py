@@ -1,23 +1,20 @@
 
 from pathlib import Path
+from typing import Any
 
+import math
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from src.input_layer import load_issues
-from src.processing import process_issues
-from src.scoring import calculate_priority, explain_priority
-from src.planner import plan_interventions
-
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+ROOT = Path(__file__).resolve().parent
+DATA_PATH = ROOT / "data" / "ranked_real_issues.csv"
 
 app = FastAPI(
     title="CivicPriority API",
-    description="Urban Infrastructure Priority Engine API",
-    version="1.0.0",
+    description="Historical civic complaints, geographic records, scoring and intervention planning.",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -25,11 +22,140 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://localhost:5173",
+        "https://civicpriority.onrender.com",
     ],
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+historical_df = None
+
+
+def clean_value(value: Any):
+    if value is None:
+        return None
+
+    if pd.isna(value):
+        return None
+
+    if hasattr(value, "item"):
+        value = value.item()
+
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+
+    return value
+
+
+def clean_records(df: pd.DataFrame):
+    return [
+        {str(key): clean_value(value) for key, value in row.items()}
+        for row in df.to_dict(orient="records")
+    ]
+
+
+def load_historical():
+    global historical_df
+
+    if historical_df is not None:
+        return historical_df
+
+    if not DATA_PATH.exists():
+        raise HTTPException(
+            status_code=500,
+            detail=f"Historical CSV not found at {DATA_PATH}",
+        )
+
+    df = pd.read_csv(DATA_PATH, low_memory=False)
+
+    if df.empty:
+        raise HTTPException(
+            status_code=500,
+            detail="Historical CSV exists but contains no records.",
+        )
+
+    df.columns = [str(column).strip() for column in df.columns]
+    historical_df = df
+    return historical_df
+
+
+def find_column(df, candidates):
+    lookup = {str(column).strip().lower(): column for column in df.columns}
+
+    for candidate in candidates:
+        found = lookup.get(candidate.lower())
+        if found is not None:
+            return found
+
+    return None
+
+
+def normalized_record(row, columns):
+    result = dict(row)
+
+    aliases = {
+        "_id": ["record_id", "issue_id", "complaint_id", "request_id", "id"],
+        "_title": ["title", "complaint_title", "description", "subject"],
+        "_category": ["category_title", "category", "issue_type", "complaint_type"],
+        "_subcategory": ["sub_category_title", "subcategory", "sub_category"],
+        "_status": ["complaint_status_title", "status", "state"],
+        "_ward": ["ward_name", "ward", "ward_no", "ward_id", "zone"],
+        "_date": ["created_at", "date", "created_date", "timestamp", "complaint_date"],
+        "_score": ["historical_review_score", "priority_score", "review_score", "score"],
+    }
+
+    for normalized_name, candidates in aliases.items():
+        source_column = find_column(
+            pd.DataFrame(columns=columns),
+            candidates,
+        )
+
+        result[normalized_name] = (
+            clean_value(row.get(source_column))
+            if source_column is not None
+            else None
+        )
+
+    latitude_column = find_column(
+        pd.DataFrame(columns=columns),
+        ["latitude", "lat", "complaint_latitude", "y"],
+    )
+
+    longitude_column = find_column(
+        pd.DataFrame(columns=columns),
+        ["longitude", "lon", "lng", "complaint_longitude", "x"],
+    )
+
+    latitude = clean_value(row.get(latitude_column)) if latitude_column else None
+    longitude = clean_value(row.get(longitude_column)) if longitude_column else None
+
+    try:
+        latitude = float(latitude) if latitude is not None else None
+        longitude = float(longitude) if longitude is not None else None
+    except (ValueError, TypeError):
+        latitude = None
+        longitude = None
+
+    result["_latitude"] = latitude
+    result["_longitude"] = longitude
+    result["_has_coordinates"] = (
+        latitude is not None
+        and longitude is not None
+        and -90 <= latitude <= 90
+        and -180 <= longitude <= 180
+    )
+
+    if not result.get("_category"):
+        result["_category"] = "Uncategorized (missing category)"
+
+    if not result.get("_status"):
+        result["_status"] = "Unknown"
+
+    return result
 
 
 class ScoreRequest(BaseModel):
@@ -43,149 +169,244 @@ class PlanRequest(BaseModel):
     issues: list[dict] | None = None
 
 
-def get_processed_issues():
-    raw_issues = load_issues()
-    return process_issues(raw_issues)
-
-
-def get_ranked_issues(issues=None):
-    if issues is None:
-        issues = get_processed_issues()
-
-    return calculate_priority(pd.DataFrame(issues))
-
-
-def records_from_dataframe(df):
-    clean_df = df.copy()
-    clean_df = clean_df.astype(object)
-    clean_df = clean_df.where(pd.notna(clean_df), None)
-    return clean_df.to_dict(orient="records")
+@app.get("/")
+def root():
+    return {
+        "name": "CivicPriority API",
+        "docs": "/docs",
+        "health": "/api/health",
+        "historical": "/api/historical",
+        "analytics": "/api/historical/analytics",
+        "map": "/api/historical/map",
+    }
 
 
 @app.get("/api/health")
 def health():
+    df = load_historical()
+
     return {
         "status": "ok",
         "service": "CivicPriority API",
+        "historical_records": int(len(df)),
+        "source_file": DATA_PATH.name,
+        "columns_available": df.columns.tolist(),
+    }
+
+
+@app.get("/api/historical/schema")
+def historical_schema():
+    df = load_historical()
+
+    return {
+        "total_records": int(len(df)),
+        "columns": [
+            {
+                "name": str(column),
+                "dtype": str(df[column].dtype),
+                "non_null_count": int(df[column].notna().sum()),
+                "null_count": int(df[column].isna().sum()),
+                "sample_values": [
+                    clean_value(value)
+                    for value in df[column].dropna().head(3).tolist()
+                ],
+            }
+            for column in df.columns
+        ],
     }
 
 
 @app.get("/api/historical")
-def historical(limit: int = 100, offset: int = 0):
-    if limit < 1 or limit > 1000 or offset < 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Limit must be 1-1000 and offset must be non-negative.",
-        )
+def get_historical(
+    limit: int = Query(default=500, ge=1, le=20000),
+    offset: int = Query(default=0, ge=0),
+    category: str | None = None,
+    status: str | None = None,
+    search: str | None = None,
+    min_score: float | None = None,
+    max_score: float | None = None,
+):
+    df = load_historical()
+    filtered = df.copy()
 
-    file_path = DATA_DIR / "ranked_real_issues.csv"
+    category_column = find_column(
+        filtered,
+        ["category_title", "category", "issue_type", "complaint_type"],
+    )
 
-    if not file_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="Historical dataset was not found.",
-        )
+    status_column = find_column(
+        filtered,
+        ["complaint_status_title", "status", "state"],
+    )
 
-    df = pd.read_csv(file_path)
+    score_column = find_column(
+        filtered,
+        ["historical_review_score", "priority_score", "review_score", "score"],
+    )
+
+    if category and category_column:
+        filtered = filtered[
+            filtered[category_column].fillna(
+                "Uncategorized (missing category)"
+            ).astype(str).str.casefold() == category.casefold()
+        ]
+
+    if status and status_column:
+        filtered = filtered[
+            filtered[status_column].fillna("Unknown").astype(str).str.casefold()
+            == status.casefold()
+        ]
+
+    if search:
+        search_text = search.casefold()
+        mask = filtered.astype(str).apply(
+            lambda column: column.str.casefold().str.contains(
+                search_text,
+                regex=False,
+                na=False,
+            )
+        ).any(axis=1)
+        filtered = filtered[mask]
+
+    if score_column and (min_score is not None or max_score is not None):
+        scores = pd.to_numeric(filtered[score_column], errors="coerce")
+
+        if min_score is not None:
+            filtered = filtered[scores >= min_score]
+            scores = pd.to_numeric(filtered[score_column], errors="coerce")
+
+        if max_score is not None:
+            filtered = filtered[scores <= max_score]
+
+    total_filtered = len(filtered)
+    page = filtered.iloc[offset:offset + limit]
+
+    records = [
+        normalized_record(row, df.columns)
+        for row in page.to_dict(orient="records")
+    ]
 
     return {
-        "total": len(df),
+        "total": int(len(df)),
+        "filtered_total": int(total_filtered),
         "limit": limit,
         "offset": offset,
-        "records": records_from_dataframe(
-            df.iloc[offset:offset + limit]
-        ),
+        "returned": len(records),
+        "columns": df.columns.tolist(),
+        "records": records,
     }
 
 
-@app.post("/api/score")
-def score(request: ScoreRequest):
-    try:
-        if request.issues is None:
-            ranked = get_ranked_issues()
-        else:
-            if not request.issues:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Provide at least one issue to score.",
-                )
+@app.get("/api/historical/map")
+def historical_map(
+    limit: int = Query(default=20000, ge=1, le=20000),
+    category: str | None = None,
+    status: str | None = None,
+    min_score: float | None = None,
+    max_score: float | None = None,
+):
+    response = get_historical(
+        limit=limit,
+        offset=0,
+        category=category,
+        status=status,
+        min_score=min_score,
+        max_score=max_score,
+    )
 
-            ranked = get_ranked_issues(request.issues)
+    points = [
+        record
+        for record in response["records"]
+        if record["_has_coordinates"]
+    ]
 
-        records = records_from_dataframe(ranked)
-        explanations = []
-
-        for index, (_, row) in enumerate(ranked.iterrows()):
-            explanation = explain_priority(row)
-            explanations.append({
-                "issue_id": str(row.get("issue_id", row.get("id", index))),
-                "explanation": explanation,
-            })
-
-        return {
-            "count": len(records),
-            "issues": records,
-            "explanations": explanations,
-        }
-
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unable to score issues: {exc}",
-        ) from exc
+    return {
+        "total_records": response["total"],
+        "filtered_records": response["filtered_total"],
+        "returned_records": response["returned"],
+        "records_with_coordinates": len(points),
+        "records_without_coordinates": response["returned"] - len(points),
+        "points": points,
+    }
 
 
-@app.post("/api/plan")
-def plan(request: PlanRequest):
-    try:
-        if request.issues is None:
-            ranked = get_ranked_issues()
-        else:
-            if not request.issues:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Provide at least one issue to plan.",
-                )
+@app.get("/api/historical/analytics")
+def historical_analytics():
+    df = load_historical()
 
-            ranked = get_ranked_issues(request.issues)
+    category_column = find_column(
+        df,
+        ["category_title", "category", "issue_type", "complaint_type"],
+    )
 
-        result = plan_interventions(
-            ranked,
-            budget=request.budget,
-            available_crews=request.available_crews,
-            available_equipment=request.available_equipment,
+    status_column = find_column(
+        df,
+        ["complaint_status_title", "status", "state"],
+    )
+
+    score_column = find_column(
+        df,
+        ["historical_review_score", "priority_score", "review_score", "score"],
+    )
+
+    date_column = find_column(
+        df,
+        ["created_at", "date", "created_date", "timestamp", "complaint_date"],
+    )
+
+    category_counts = {}
+    status_counts = {}
+
+    if category_column:
+        category_counts = (
+            df[category_column]
+            .fillna("Uncategorized (missing category)")
+            .astype(str)
+            .value_counts()
+            .to_dict()
         )
 
-        if isinstance(result, pd.DataFrame):
-            return {
-                "issues": records_from_dataframe(result),
-            }
+    if status_column:
+        status_counts = (
+            df[status_column]
+            .fillna("Unknown")
+            .astype(str)
+            .value_counts()
+            .to_dict()
+        )
 
-        if isinstance(result, dict):
-            response = {}
+    scores = (
+        pd.to_numeric(df[score_column], errors="coerce").dropna()
+        if score_column
+        else pd.Series(dtype=float)
+    )
 
-            for key, value in result.items():
-                if isinstance(value, pd.DataFrame):
-                    response[key] = records_from_dataframe(value)
-                elif isinstance(value, pd.Series):
-                    response[key] = records_from_dataframe(
-                        value.to_frame().T
-                    )
-                elif hasattr(value, "item"):
-                    response[key] = value.item()
-                else:
-                    response[key] = value
+    dates = (
+        pd.to_datetime(df[date_column], errors="coerce").dropna()
+        if date_column
+        else pd.Series(dtype="datetime64[ns]")
+    )
 
-            return response
-
-        return {"result": result}
-
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unable to plan interventions: {exc}",
-        ) from exc
+    return {
+        "total_records": int(len(df)),
+        "unique_categories": int(df[category_column].nunique(dropna=True))
+        if category_column else 0,
+        "missing_categories": int(df[category_column].isna().sum())
+        if category_column else None,
+        "category_counts": category_counts,
+        "status_counts": status_counts,
+        "score": {
+            "column": score_column,
+            "count": int(scores.count()),
+            "min": float(scores.min()) if not scores.empty else None,
+            "max": float(scores.max()) if not scores.empty else None,
+            "mean": float(scores.mean()) if not scores.empty else None,
+            "median": float(scores.median()) if not scores.empty else None,
+        },
+        "date_range": {
+            "column": date_column,
+            "start": dates.min().isoformat() if not dates.empty else None,
+            "end": dates.max().isoformat() if not dates.empty else None,
+        },
+        "columns_available": df.columns.tolist(),
+    }
