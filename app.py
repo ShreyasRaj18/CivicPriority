@@ -1,10 +1,11 @@
 from pathlib import Path
+import html
 
 import pandas as pd
 import plotly.express as px
 import pydeck as pdk
 import streamlit as st
-
+import re
 
 ROOT = Path(__file__).resolve().parent
 REAL_DATA_FILE = ROOT / "data" / "ranked_real_issues.csv"
@@ -23,29 +24,53 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Serif+Text&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap');
 
     html, body, [class*="css"] {
         font-family: 'DM Sans', sans-serif;
     }
 
-    h1, h2, h3 {
-        font-family: 'DM Serif Text', Georgia, serif !important;
-        letter-spacing: -.025em;
+    h1, h2, h3, h4, h5, h6 {
+        font-family: 'DM Sans', sans-serif !important;
+        letter-spacing: -.02em;
     }
 
     .block-container {
-        max-width: 1550px;
-        padding-top: 1.5rem;
-        padding-bottom: 3rem;
+        max-width: 1440px;
+        padding-top: 1.1rem;
+        padding-bottom: 2.5rem;
+    }
+    :root { color-scheme: light; }
+    [data-testid="stAppViewContainer"] { background: #f7f8fc; color: #17213b; }
+    [data-testid="stHeader"] { background: rgba(247,248,252,.92); }
+    [data-testid="stSidebar"] { background: #ffffff; border-right: 1px solid #e7eaf2; }
+    [data-testid="stMetric"] {
+        background: #ffffff;
+        border: 1px solid #e6e9f2;
+        padding: 1rem 1.1rem;
+        border-radius: 16px;
+        box-shadow: 0 2px 10px rgba(20,32,70,.035);
+    }
+    div[data-testid="stDataFrame"] {
+        border: 1px solid #e6e9f2;
+        border-radius: 14px;
+        overflow: hidden;
+        background: #ffffff;
+    }
+    div[data-testid="stPlotlyChart"] {
+        background: #ffffff;
+        border: 1px solid #e6e9f2;
+        border-radius: 16px;
+        padding: .35rem;
     }
 
     .hero-panel {
-        padding: 1.6rem 1.8rem;
-        border-radius: 18px;
+        padding: 2rem 2.1rem;
+        border-radius: 22px;
         color: white;
-        background: linear-gradient(120deg, #0719b8 0%, #344be0 100%);
-        margin-bottom: 1.2rem;
+        background: linear-gradient(118deg, #101d54 0%, #2449bd 58%, #5577ef 100%);
+        margin-bottom: 1rem;
+        box-shadow: 0 12px 32px rgba(27,57,150,.16);
     }
 
     .hero-panel h1 {
@@ -93,11 +118,37 @@ st.markdown(
         background: #0719b8;
         border-color: #0719b8;
     }
+    [data-testid="stPydeckChart"] { cursor: crosshair; }
+    .map-instructions { display:flex; flex-wrap:wrap; gap:.55rem; margin:.45rem 0 .8rem; }
+    .map-instructions span { background:#fff; border:1px solid #dce3f1; border-radius:999px; padding:.35rem .7rem; color:#34415e; font-size:.86rem; }
+    .selection-pulse { border:1px solid #cbd8ff; background:#f3f6ff; border-radius:12px; padding:.8rem 1rem; animation: selectionFade 1.2s ease-out 1; }
+    @keyframes selectionFade { 0% { background:#dce6ff; box-shadow:0 0 0 4px rgba(49,87,213,.12); } 100% { background:#f3f6ff; box-shadow:0 0 0 0 rgba(49,87,213,0); } }
     </style>
     """,
     unsafe_allow_html=True,
 )
+def clean_title(value):
+    if pd.isna(value):
+        return "Untitled complaint"
 
+    title = html.unescape(str(value)).strip()
+    title = re.sub(r"\s+", " ", title)
+
+    if not title:
+        return "Untitled complaint"
+
+    if len(title) < 4:
+        return "Unclear complaint title"
+
+    if re.fullmatch(r"[\W_]+", title):
+        return "Unclear complaint title"
+
+    compact = re.sub(r"[^A-Za-z0-9]", "", title)
+    if re.search(r"(?i)(?:[a-z]\d){3,}|(?:\d[a-z]){3,}", compact):
+        return "Unclear complaint title"
+    if re.fullmatch(r"[A-Za-z0-9]{8,}", compact) and not re.search(r"[aeiou]", compact, re.I):
+        return "Unclear complaint title"
+    return title
 
 @st.cache_data(show_spinner="Loading historical complaint records…")
 def load_real_data(path: str, modified_time: float) -> pd.DataFrame:
@@ -106,6 +157,9 @@ def load_real_data(path: str, modified_time: float) -> pd.DataFrame:
     for column in ["priority_score", "priority_rank", "latitude", "longitude", "recurrence_count"]:
         if column in frame.columns:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
+
+    if "title" in frame.columns:
+        frame["title"] = frame["title"].apply(clean_title)
 
     if "created_at" in frame.columns:
         frame["created_at"] = pd.to_datetime(frame["created_at"], errors="coerce")
@@ -188,8 +242,8 @@ def make_map_frame(frame: pd.DataFrame) -> pd.DataFrame:
     result["longitude"] = pd.to_numeric(result["longitude"], errors="coerce")
     result = result.dropna(subset=["latitude", "longitude"])
     result = result[
-        result["latitude"].between(-90, 90)
-        & result["longitude"].between(-180, 180)
+        result["latitude"].between(12.70, 13.25)
+        & result["longitude"].between(77.35, 77.85)
     ].copy()
 
     if result.empty:
@@ -200,11 +254,10 @@ def make_map_frame(frame: pd.DataFrame) -> pd.DataFrame:
     else:
         result["map_record_id"] = result.index.astype(str)
 
-    result["map_title"] = (
-        result["title"].fillna("Civic complaint").astype(str)
-        if "title" in result.columns
-        else "Civic complaint"
-    )
+    if "title" in result.columns:
+        result["map_title"] = result["title"].apply(clean_title)
+    else:
+        result["map_title"] = "Civic complaint"
     result["map_category"] = result["category_title"].fillna(UNCATEGORIZED).astype(str)
     result["map_status"] = result["complaint_status_title"].fillna("Unknown").astype(str)
     result["map_ward"] = (
@@ -346,9 +399,10 @@ with overview_tab:
     map_heading, map_metric = st.columns([3, 1])
     with map_heading:
         st.subheader("Explore complaint locations")
-        st.caption(
-            "On a laptop, left-click a point with your touchpad to select it. "
-            "The complaint details will appear below the map. Hover to preview key information; zoom in to separate nearby points."
+        st.caption("Select an individual dot to inspect the historical complaint behind it.")
+        st.markdown(
+            '<div class="map-instructions"><span>① Hover over a dot to preview it</span><span>② Click a dot to select it</span><span>③ Read the full record below the map</span><span>Scroll to zoom · Map stays focused on Bengaluru</span></div>',
+            unsafe_allow_html=True,
         )
     with map_metric:
         map_metric.metric("Mapped records", fmt_count(len(map_df)))
@@ -375,13 +429,21 @@ with overview_tab:
             },
         }
 
+        selected_id_for_map = str(st.session_state.get("selected_map_record_id", ""))
+        map_df["is_selected"] = map_df["map_record_id"].astype(str).eq(selected_id_for_map)
+        map_df["point_radius"] = map_df["is_selected"].apply(lambda selected: 115 if selected else 65)
+        map_df["point_color"] = map_df.apply(
+            lambda row: [18, 43, 150, 255] if row["is_selected"] else ([229, 72, 77, 220] if row["map_score"] >= 75 else [49, 109, 255, 210]),
+            axis=1,
+        )
+
         layer = pdk.Layer(
             "ScatterplotLayer",
             id=MAP_LAYER_ID,
             data=map_df,
             get_position="[longitude, latitude]",
             get_fill_color="point_color",
-            get_radius=65,
+            get_radius="point_radius",
             radius_min_pixels=4,
             radius_max_pixels=10,
             pickable=True,
@@ -392,11 +454,11 @@ with overview_tab:
         )
 
         view_state = pdk.ViewState(
-            latitude=float(map_df["latitude"].median()),
-            longitude=float(map_df["longitude"].median()),
-            zoom=10,
-            min_zoom=5,
-            max_zoom=17,
+            latitude=12.9716,
+            longitude=77.5946,
+            zoom=10.5,
+            min_zoom=9,
+            max_zoom=16,
             pitch=0,
         )
 
@@ -404,7 +466,20 @@ with overview_tab:
             layers=[layer],
             initial_view_state=view_state,
             tooltip=tooltip,
-            map_style="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+            map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+            views=[
+                pdk.View(
+                    type="MapView",
+                    controller={
+                        "dragPan": False,
+                        "scrollZoom": True,
+                        "doubleClickZoom": True,
+                        "touchZoom": True,
+                        "dragRotate": False,
+                        "keyboard": False,
+                    },
+                )
+            ],
         )
 
         try:
@@ -449,13 +524,14 @@ with overview_tab:
 
         if selected_map_record:
             st.divider()
+            st.markdown('<div class="selection-pulse"><strong>Point selected</strong> · Complaint details are shown below. The selected point is highlighted in dark blue on the map.</div>', unsafe_allow_html=True)
             st.markdown("### Selected complaint")
             st.caption(
                 "This is the record attached to the point you selected. "
                 "Check current conditions before acting on historical information."
             )
 
-            title = clean_text(selected_map_record.get("map_title"), "Civic complaint")
+            title = clean_title(selected_map_record.get("map_title", "Civic complaint"))
             st.markdown(f"#### {title}")
 
             detail1, detail2, detail3 = st.columns(3)
@@ -544,8 +620,13 @@ with overview_tab:
             )
             figure.update_layout(
                 height=380,
-                margin=dict(l=10, r=15, t=15, b=10),
+                margin=dict(l=12, r=18, t=18, b=12),
                 showlegend=False,
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(family="DM Sans, sans-serif", color="#27324b"),
+                xaxis=dict(showgrid=True, gridcolor="#edf0f6", zeroline=False),
+                yaxis=dict(showgrid=False),
             )
             st.plotly_chart(figure, use_container_width=True)
         else:
@@ -576,8 +657,11 @@ with overview_tab:
             )
             figure.update_layout(
                 height=380,
-                margin=dict(l=10, r=10, t=15, b=10),
+                margin=dict(l=12, r=12, t=18, b=12),
                 legend_title_text="",
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(family="DM Sans, sans-serif", color="#27324b"),
             )
             st.plotly_chart(figure, use_container_width=True)
         else:
