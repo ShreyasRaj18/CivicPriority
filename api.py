@@ -32,30 +32,53 @@ app.add_middleware(
 historical_df = None
 
 
-def clean_value(value: Any):
-    if value is None:
+
+import math
+import pandas as pd
+import numpy as np
+
+
+def clean_value(value):
+    if value is None or value is pd.NA or value is pd.NaT:
         return None
 
-    if pd.isna(value):
-        return None
+    if isinstance(value, dict):
+        return {
+            str(key): clean_value(item)
+            for key, item in value.items()
+        }
 
-    if hasattr(value, "item"):
+    if isinstance(value, (list, tuple)):
+        return [clean_value(item) for item in value]
+
+    if isinstance(value, np.generic):
         value = value.item()
 
     if isinstance(value, float) and not math.isfinite(value):
         return None
 
+    if isinstance(value, (pd.Timestamp, pd.Timedelta)):
+        return value.isoformat()
+
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+
+    if isinstance(value, (str, int, float, bool)):
+        return value
+
     if hasattr(value, "isoformat"):
         return value.isoformat()
 
-    return value
+    return str(value)
+
 
 
 def clean_records(df: pd.DataFrame):
-    return [
-        {str(key): clean_value(value) for key, value in row.items()}
-        for row in df.to_dict(orient="records")
-    ]
+    records = df.to_dict(orient="records")
+    return clean_value(records)
 
 
 def load_historical():
@@ -155,8 +178,7 @@ def normalized_record(row, columns):
     if not result.get("_status"):
         result["_status"] = "Unknown"
 
-    return result
-
+    return clean_value(result)
 
 class ScoreRequest(BaseModel):
     issues: list[dict] | None = None
