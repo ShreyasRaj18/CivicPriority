@@ -7,6 +7,7 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from functools import lru_cache
 
 ROOT = Path(__file__).resolve().parent
 DATA_PATH = ROOT / "data" / "ranked_real_issues.csv"
@@ -178,7 +179,7 @@ def normalized_record(row, columns):
     if not result.get("_status"):
         result["_status"] = "Unknown"
 
-    return clean_value(result)
+    return clean_value(result)  
 
 class ScoreRequest(BaseModel):
     issues: list[dict] | None = None
@@ -321,36 +322,60 @@ def get_historical(
 
 @app.get("/api/historical/map")
 def historical_map(
-    limit: int = Query(default=20000, ge=1, le=20000),
-    category: str | None = None,
-    status: str | None = None,
-    min_score: float | None = None,
-    max_score: float | None = None,
+    limit: int = Query(5000, ge=1, le=15000),
 ):
-    response = get_historical(
-        limit=limit,
-        offset=0,
-        category=category,
-        status=status,
-        min_score=min_score,
-        max_score=max_score,
-    )
+    df = load_historical()
 
-    points = [
-        record
-        for record in response["records"]
-        if record["_has_coordinates"]
+    latitude_columns = [
+        "latitude", "Latitude", "LATITUDE", "lat", "_latitude"
+    ]
+    longitude_columns = [
+        "longitude", "Longitude", "LONGITUDE", "lng", "lon", "_longitude"
     ]
 
+    lat_col = next(
+        (column for column in latitude_columns if column in df.columns),
+        None,
+    )
+    lon_col = next(
+        (column for column in longitude_columns if column in df.columns),
+        None,
+    )
+
+    if lat_col is None or lon_col is None:
+        return {
+            "total_records": len(df),
+            "records_with_coordinates": 0,
+            "records_without_coordinates": len(df),
+            "points": [],
+            "available_columns": list(df.columns),
+            "error": "Latitude and longitude columns were not found.",
+        }
+
+    lat = pd.to_numeric(df[lat_col], errors="coerce")
+    lon = pd.to_numeric(df[lon_col], errors="coerce")
+
+    valid = (
+        lat.between(-90, 90)
+        & lon.between(-180, 180)
+    )
+
+    mapped = df.loc[valid].copy()
+    mapped["_latitude"] = lat.loc[valid]
+    mapped["_longitude"] = lon.loc[valid]
+
+    total_with_coordinates = len(mapped)
+    mapped = mapped.head(limit)
+
+    points = clean_records(mapped)
+
     return {
-        "total_records": response["total"],
-        "filtered_records": response["filtered_total"],
-        "returned_records": response["returned"],
-        "records_with_coordinates": len(points),
-        "records_without_coordinates": response["returned"] - len(points),
+        "total_records": len(df),
+        "records_with_coordinates": total_with_coordinates,
+        "records_without_coordinates": len(df) - total_with_coordinates,
+        "returned_records": len(points),
         "points": points,
     }
-
 
 @app.get("/api/historical/analytics")
 def historical_analytics():

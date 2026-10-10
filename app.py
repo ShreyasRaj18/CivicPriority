@@ -1,211 +1,301 @@
-
 from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
+import pydeck as pdk
 import streamlit as st
-
-from src.input_layer import load_issues
-from src.processing import process_issues
-from src.scoring import calculate_priority
-from src.planner import plan_interventions
 
 
 ROOT = Path(__file__).resolve().parent
 REAL_DATA_FILE = ROOT / "data" / "ranked_real_issues.csv"
 UNCATEGORIZED = "Uncategorized (missing category)"
-
-URGENCY_FACTORS = {
-    "severity_score": ("Severity", 30),
-    "population_score": ("Population affected", 25),
-    "recurrence_score": ("Recurrence", 15),
-    "duration_score": ("Duration", 10),
-    "geographic_score": ("Geographic context", 10),
-}
-
-RESOURCE_FACTOR = "resource_requirement_score"
-ALL_FACTORS = {
-    **URGENCY_FACTORS,
-    RESOURCE_FACTOR: ("Resource feasibility", 10),
-}
+MAP_LAYER_ID = "complaint_points"
 
 
 st.set_page_config(
-    page_title="CivicPriority",
+    page_title="CivicPriority | Bengaluru",
     page_icon="🏙️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("🏙️ CivicPriority")
-st.subheader("Urban Infrastructure Priority Engine")
-st.caption(
-    "Explainable complaint analysis, six-factor scoring and "
-    "resource-aware intervention planning."
+
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Serif+Text&display=swap');
+
+    html, body, [class*="css"] {
+        font-family: 'DM Sans', sans-serif;
+    }
+
+    h1, h2, h3 {
+        font-family: 'DM Serif Text', Georgia, serif !important;
+        letter-spacing: -.025em;
+    }
+
+    .block-container {
+        max-width: 1550px;
+        padding-top: 1.5rem;
+        padding-bottom: 3rem;
+    }
+
+    .hero-panel {
+        padding: 1.6rem 1.8rem;
+        border-radius: 18px;
+        color: white;
+        background: linear-gradient(120deg, #0719b8 0%, #344be0 100%);
+        margin-bottom: 1.2rem;
+    }
+
+    .hero-panel h1 {
+        color: white !important;
+        margin-bottom: .35rem;
+    }
+
+    .hero-panel p {
+        color: rgba(255,255,255,.9);
+        margin-bottom: 0;
+        font-size: 1rem;
+    }
+
+    [data-testid="stMetric"] {
+        background: #f6f7ff;
+        border: 1px solid #e3e7ff;
+        padding: 1rem;
+        border-radius: 12px;
+    }
+
+    [data-testid="stMetricLabel"] {
+        color: #505776;
+    }
+
+    [data-testid="stMetricValue"] {
+        color: #0719b8;
+    }
+
+    div[data-testid="stDataFrame"] {
+        border: 1px solid #e5e7eb;
+        border-radius: 10px;
+        overflow: hidden;
+    }
+
+    .info-note {
+        border-left: 4px solid #0719b8;
+        background: #f4f6ff;
+        padding: .85rem 1rem;
+        border-radius: 0 9px 9px 0;
+        color: #333b60;
+        margin: .7rem 0 1rem;
+    }
+
+    div.stButton > button[kind="primary"] {
+        background: #0719b8;
+        border-color: #0719b8;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 
-@st.cache_data
-def load_real_data(path, modified_time):
-    df = pd.read_csv(path, encoding="utf-8-sig", low_memory=False)
+@st.cache_data(show_spinner="Loading historical complaint records…")
+def load_real_data(path: str, modified_time: float) -> pd.DataFrame:
+    frame = pd.read_csv(path, encoding="utf-8-sig", low_memory=False)
 
-    for col in ["priority_score", "priority_rank", "latitude", "longitude"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+    for column in ["priority_score", "priority_rank", "latitude", "longitude", "recurrence_count"]:
+        if column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
 
-    if "created_at" in df.columns:
-        df["created_at"] = pd.to_datetime(
-            df["created_at"], errors="coerce"
+    if "created_at" in frame.columns:
+        frame["created_at"] = pd.to_datetime(frame["created_at"], errors="coerce")
+
+    if "category_title" in frame.columns:
+        frame["category_title"] = (
+            frame["category_title"].fillna(UNCATEGORIZED).replace("", UNCATEGORIZED)
         )
 
-    if "category_title" in df.columns:
-        df["category_title"] = (
-            df["category_title"]
-            .fillna(UNCATEGORIZED)
-            .replace("", UNCATEGORIZED)
+    if "complaint_status_title" in frame.columns:
+        frame["complaint_status_title"] = (
+            frame["complaint_status_title"].fillna("Unknown").replace("", "Unknown")
         )
 
-    if "complaint_status_title" in df.columns:
-        df["complaint_status_title"] = (
-            df["complaint_status_title"]
-            .fillna("Unknown")
-            .replace("", "Unknown")
-        )
-
-    return df
+    return frame
 
 
-@st.cache_data
-def load_sample_data():
-    raw = load_issues()
-    processed = process_issues(raw)
-    return calculate_priority(processed)
+def fmt_count(value) -> str:
+    try:
+        return f"{int(value):,}"
+    except (TypeError, ValueError):
+        return "0"
 
 
-def apply_scenario_weights(sample, weights):
-    scenario = sample.copy()
+def available_columns(frame: pd.DataFrame, columns: list[str]) -> list[str]:
+    return [column for column in columns if column in frame.columns]
 
-    total_weight = sum(weights.values())
-    urgency_weight = sum(weights[factor] for factor in URGENCY_FACTORS)
 
-    if total_weight <= 0:
-        raise ValueError("At least one factor must have a non-zero weight.")
+def clean_text(value, fallback="Not recorded") -> str:
+    if value is None:
+        return fallback
+    try:
+        if pd.isna(value):
+            return fallback
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    return text if text else fallback
 
-    for factor in ALL_FACTORS:
-        scenario[f"{factor}_contribution"] = (
-            pd.to_numeric(scenario[factor], errors="coerce")
-            * weights[factor]
-            / total_weight
-        )
 
-    scenario["priority_score"] = sum(
-        scenario[f"{factor}_contribution"]
-        for factor in ALL_FACTORS
-    ).round(2)
+def selection_from_event(event, layer_id: str):
+    """Read a selected map object across Streamlit's supported selection-state shapes."""
+    if event is None:
+        return None
 
-    if urgency_weight > 0:
-        scenario["urgency_score"] = sum(
-            pd.to_numeric(scenario[factor], errors="coerce")
-            * weights[factor]
-            for factor in URGENCY_FACTORS
-        ).div(urgency_weight).round(2)
+    selection = getattr(event, "selection", None)
+    if selection is None and isinstance(event, dict):
+        selection = event.get("selection", event)
+
+    objects = getattr(selection, "objects", None)
+    if objects is None and isinstance(selection, dict):
+        objects = selection.get("objects", {})
+
+    if not isinstance(objects, dict):
+        return None
+
+    candidates = objects.get(layer_id, [])
+    if isinstance(candidates, dict):
+        candidates = [candidates]
+
+    if not candidates:
+        for value in objects.values():
+            if isinstance(value, dict):
+                candidates = [value]
+                break
+            if isinstance(value, list) and value and isinstance(value[0], dict):
+                candidates = value
+                break
+
+    return candidates[0] if candidates else None
+
+
+def make_map_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    result = frame.copy()
+
+    if not {"latitude", "longitude"}.issubset(result.columns):
+        return pd.DataFrame()
+
+    result["latitude"] = pd.to_numeric(result["latitude"], errors="coerce")
+    result["longitude"] = pd.to_numeric(result["longitude"], errors="coerce")
+    result = result.dropna(subset=["latitude", "longitude"])
+    result = result[
+        result["latitude"].between(-90, 90)
+        & result["longitude"].between(-180, 180)
+    ].copy()
+
+    if result.empty:
+        return result
+
+    if "record_id" in result.columns:
+        result["map_record_id"] = result["record_id"].astype(str)
     else:
-        scenario["urgency_score"] = 0.0
+        result["map_record_id"] = result.index.astype(str)
 
-    scenario = scenario.sort_values(
-        ["priority_score", "urgency_score"],
-        ascending=[False, False],
-    ).reset_index(drop=True)
-
-    scenario["priority_rank"] = range(1, len(scenario) + 1)
-
-    return scenario
-
-
-def explain_scenario_priority(row, weights):
-    total_weight = sum(weights.values())
-
-    contributions = [
-        (
-            ALL_FACTORS[factor][0],
-            float(row[factor]) * weights[factor] / total_weight,
-        )
-        for factor in ALL_FACTORS
-    ]
-
-    strongest = sorted(
-        contributions,
-        key=lambda item: item[1],
-        reverse=True,
-    )[:3]
-
-    reasons = "; ".join(
-        f"{name} ({value:.1f} points)"
-        for name, value in strongest
+    result["map_title"] = (
+        result["title"].fillna("Civic complaint").astype(str)
+        if "title" in result.columns
+        else "Civic complaint"
+    )
+    result["map_category"] = result["category_title"].fillna(UNCATEGORIZED).astype(str)
+    result["map_status"] = result["complaint_status_title"].fillna("Unknown").astype(str)
+    result["map_ward"] = (
+        result["ward_title"].fillna("Not recorded").astype(str)
+        if "ward_title" in result.columns
+        else "Not recorded"
+    )
+    result["map_score"] = pd.to_numeric(result["priority_score"], errors="coerce")
+    result["map_score"] = result["map_score"].fillna(-1)
+    result["point_color"] = result["map_score"].apply(
+        lambda score: [229, 72, 77, 220] if score >= 75 else [49, 109, 255, 210]
     )
 
-    return (
-        f"Urgency: {row['urgency_score']:.2f}/100; "
-        f"overall priority: {row['priority_score']:.2f}/100; "
-        f"strongest contributions: {reasons}"
-    )
+    return result
 
 
 if not REAL_DATA_FILE.exists():
-    st.error(f"Historical dataset not found: {REAL_DATA_FILE}")
+    st.error(
+        "The historical dataset could not be found. Ensure "
+        "data/ranked_real_issues.csv exists in the project."
+    )
     st.stop()
 
 try:
-    real_df = load_real_data(
-        str(REAL_DATA_FILE),
-        REAL_DATA_FILE.stat().st_mtime,
+    real_df = load_real_data(str(REAL_DATA_FILE), REAL_DATA_FILE.stat().st_mtime)
+except Exception:
+    st.error(
+        "CivicPriority could not load the historical dataset. "
+        "Check that the CSV exists and is readable."
     )
-    sample_df = load_sample_data()
-except Exception as exc:
-    st.error(f"Could not initialize CivicPriority: {exc}")
     st.stop()
 
 
-required_real = [
+required_columns = [
     "priority_score",
     "priority_rank",
     "category_title",
     "complaint_status_title",
 ]
+missing_columns = [column for column in required_columns if column not in real_df.columns]
 
-missing_real = [col for col in required_real if col not in real_df.columns]
-
-if missing_real:
-    st.error(f"Historical dataset is missing columns: {missing_real}")
+if missing_columns:
+    st.error("The historical dataset is missing required fields: " + ", ".join(missing_columns))
     st.stop()
 
-categories = sorted(real_df["category_title"].unique().tolist())
-statuses = sorted(real_df["complaint_status_title"].unique().tolist())
 
-st.sidebar.title("Historical Analysis")
-
-selected_categories = st.sidebar.multiselect(
-    "Categories",
-    categories,
-    default=categories,
-)
-
-selected_statuses = st.sidebar.multiselect(
-    "Historical statuses",
-    statuses,
-    default=statuses,
-)
+categories = sorted(real_df["category_title"].dropna().astype(str).unique().tolist())
+statuses = sorted(real_df["complaint_status_title"].dropna().astype(str).unique().tolist())
 
 score_min = float(real_df["priority_score"].min())
 score_max = float(real_df["priority_score"].max())
 
+
+st.sidebar.markdown("## CivicPriority")
+st.sidebar.caption("Bengaluru civic complaint explorer")
+st.sidebar.divider()
+
+selected_categories = st.sidebar.multiselect(
+    "Complaint categories",
+    options=categories,
+    default=categories,
+    help="Choose which types of complaints appear in the map, charts and tables.",
+)
+
+selected_statuses = st.sidebar.multiselect(
+    "Status in historical records",
+    options=statuses,
+    default=statuses,
+    help="These are historical statuses from the source dataset, not live updates.",
+)
+
 score_range = st.sidebar.slider(
-    "Historical review score",
+    "Historical priority score",
     min_value=0.0,
     max_value=100.0,
     value=(score_min, score_max),
     step=1.0,
+    help="Show records in this historical score range.",
 )
+
+if st.sidebar.button("Reset filters", use_container_width=True):
+    for key in [
+        "selected_map_record_id",
+        "complaint_map",
+        "category_filter",
+        "status_filter",
+        "score_filter",
+    ]:
+        st.session_state.pop(key, None)
+    st.rerun()
+
 
 historical = real_df[
     real_df["category_title"].isin(selected_categories)
@@ -214,80 +304,255 @@ historical = real_df[
 ].copy()
 
 
-overview_tab, historical_tab, scoring_tab, planner_tab, map_tab, methodology_tab = st.tabs(
-    [
-        "Overview",
-        "Historical Complaints",
-        "Six-Factor Scoring",
-        "Intervention Planner",
-        "Map View",
-        "Methodology",
-    ]
+st.markdown(
+    """
+    <div class="hero-panel">
+      <h1>CivicPriority</h1>
+      <p>Explore where civic complaints were recorded, understand historical patterns, and compare the issues that ranked highest in the dataset.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+st.caption("Bengaluru historical complaints · 2019–2022 · Historical decision-support tool")
+
+
+overview_tab, records_tab, about_tab = st.tabs(
+    ["City overview", "Explore complaints", "About the data"]
 )
 
 
 with overview_tab:
     open_count = int(
-        historical["complaint_status_title"]
-        .astype(str)
-        .str.lower()
-        .eq("open")
-        .sum()
+        historical["complaint_status_title"].astype(str).str.lower().eq("open").sum()
+    )
+    mean_score = historical["priority_score"].mean()
+    category_count = historical["category_title"].nunique()
+    map_df = make_map_frame(historical)
+
+    metric1, metric2, metric3, metric4 = st.columns(4)
+    metric1.metric("Complaints in view", fmt_count(len(historical)))
+    metric2.metric("Recorded as open", fmt_count(open_count))
+    metric3.metric("Categories", fmt_count(category_count))
+    metric4.metric(
+        "Average historical score",
+        f"{mean_score:.1f}/100" if pd.notna(mean_score) else "—",
     )
 
-    m1, m2, m3, m4 = st.columns(4)
-
-    m1.metric("Historical complaints", f"{len(historical):,}")
-    m2.metric("Historically open", f"{open_count:,}")
-    m3.metric(
-        "Categories represented",
-        f"{historical['category_title'].nunique():,}",
-    )
-    m4.metric(
-        "Mean review score",
-        f"{historical['priority_score'].mean():.1f}/100"
-        if not historical.empty
-        else "N/A",
+    st.markdown(
+        '<div class="info-note">This is historical information, not live incident tracking. A high score means a record ranked highly under the historical review method; it does not confirm that the problem is still present.</div>',
+        unsafe_allow_html=True,
     )
 
-    st.info(
-        "Historical records are from Bengaluru, 2019–2022. Historical "
-        "status is not current status, and the historical review score "
-        "is distinct from the six-factor sample-data score."
-    )
-
-    if UNCATEGORIZED in set(historical["category_title"]):
-        missing_category_count = int(
-            historical["category_title"].eq(UNCATEGORIZED).sum()
+    map_heading, map_metric = st.columns([3, 1])
+    with map_heading:
+        st.subheader("Explore complaint locations")
+        st.caption(
+            "On a laptop, left-click a point with your touchpad to select it. "
+            "The complaint details will appear below the map. Hover to preview key information; zoom in to separate nearby points."
         )
-        st.warning(
-            f"{missing_category_count:,} historical records have no "
-            "category assigned in the source data. They are retained "
-            "under 'Uncategorized (missing category)'."
+    with map_metric:
+        map_metric.metric("Mapped records", fmt_count(len(map_df)))
+
+    selected_map_record = None
+
+    if not map_df.empty:
+        tooltip = {
+            "html": """
+                <div style="font-family: sans-serif; padding: 5px; min-width: 220px;">
+                  <b>{map_title}</b><br/>
+                  <span>Category: {map_category}</span><br/>
+                  <span>Status: {map_status}</span><br/>
+                  <span>Ward: {map_ward}</span><br/>
+                  <span>Historical score: {map_score}</span><br/>
+                  <span>Record ID: {map_record_id}</span>
+                </div>
+            """,
+            "style": {
+                "backgroundColor": "#ffffff",
+                "color": "#111827",
+                "fontSize": "12px",
+                "padding": "10px",
+            },
+        }
+
+        layer = pdk.Layer(
+            "ScatterplotLayer",
+            id=MAP_LAYER_ID,
+            data=map_df,
+            get_position="[longitude, latitude]",
+            get_fill_color="point_color",
+            get_radius=65,
+            radius_min_pixels=4,
+            radius_max_pixels=10,
+            pickable=True,
+            auto_highlight=True,
+            stroked=True,
+            get_line_color=[255, 255, 255, 220],
+            line_width_min_pixels=1,
         )
+
+        view_state = pdk.ViewState(
+            latitude=float(map_df["latitude"].median()),
+            longitude=float(map_df["longitude"].median()),
+            zoom=10,
+            min_zoom=5,
+            max_zoom=17,
+            pitch=0,
+        )
+
+        deck = pdk.Deck(
+            layers=[layer],
+            initial_view_state=view_state,
+            tooltip=tooltip,
+            map_style="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+        )
+
+        try:
+            map_event = st.pydeck_chart(
+                deck,
+                use_container_width=True,
+                height=570,
+                key="complaint_map",
+                on_select="rerun",
+                selection_mode="single-object",
+            )
+            clicked_record = selection_from_event(map_event, MAP_LAYER_ID)
+        except Exception:
+            st.error(
+                "Map point selection is not supported by the installed Streamlit version. "
+                "Run: pip install --upgrade streamlit pydeck, then restart the app."
+            )
+            clicked_record = None
+
+        if clicked_record:
+            selected_id = str(
+                clicked_record.get(
+                    "map_record_id",
+                    clicked_record.get("record_id", ""),
+                )
+            )
+            if selected_id:
+                st.session_state["selected_map_record_id"] = selected_id
+
+        saved_id = st.session_state.get("selected_map_record_id")
+        if saved_id:
+            matched = map_df[map_df["map_record_id"].astype(str) == str(saved_id)]
+            if not matched.empty:
+                selected_map_record = matched.iloc[0].to_dict()
+            else:
+                st.session_state.pop("selected_map_record_id", None)
+
+        st.caption(
+            "Blue points: historical score below 75 · Red points: historical score 75 or above. "
+            "Colour represents the historical score only, not live danger."
+        )
+
+        if selected_map_record:
+            st.divider()
+            st.markdown("### Selected complaint")
+            st.caption(
+                "This is the record attached to the point you selected. "
+                "Check current conditions before acting on historical information."
+            )
+
+            title = clean_text(selected_map_record.get("map_title"), "Civic complaint")
+            st.markdown(f"#### {title}")
+
+            detail1, detail2, detail3 = st.columns(3)
+            detail1.write("**Category**")
+            detail1.write(clean_text(selected_map_record.get("map_category")))
+            detail2.write("**Status when recorded**")
+            detail2.write(clean_text(selected_map_record.get("map_status")))
+            score_value = float(selected_map_record.get("map_score", -1))
+            detail3.metric(
+                "Historical score",
+                f"{score_value:.1f}/100" if score_value >= 0 else "Not available",
+            )
+
+            detail4, detail5, detail6 = st.columns(3)
+            detail4.write("**Record ID**")
+            detail4.write(clean_text(selected_map_record.get("map_record_id")))
+            detail5.write("**Ward / area**")
+            detail5.write(clean_text(selected_map_record.get("map_ward")))
+            detail6.write("**Date recorded**")
+            detail6.write(clean_text(selected_map_record.get("created_at")))
+
+            location = selected_map_record.get("location")
+            if location is None or pd.isna(location) or not str(location).strip():
+                location = selected_map_record.get("address")
+            st.write(f"**Reported location:** {clean_text(location)}")
+
+            description = selected_map_record.get("description")
+            if description is None or pd.isna(description) or not str(description).strip():
+                description = title
+            st.write("**What was reported**")
+            st.write(clean_text(description))
+
+            recurrence = selected_map_record.get("recurrence_count")
+            if recurrence is not None and not pd.isna(recurrence):
+                st.write(f"**Recurrence count in source data:** {clean_text(recurrence)}")
+
+            explanation = selected_map_record.get("priority_explanation")
+            if explanation is not None and not pd.isna(explanation) and str(explanation).strip():
+                with st.expander("Why did this record receive this score?"):
+                    st.write(str(explanation))
+            else:
+                st.caption(
+                    "A detailed score explanation is not available for this record."
+                )
+
+            if score_value >= 75:
+                st.warning(
+                    "This record ranked highly in the historical review. "
+                    "That does not confirm the problem is still present or urgent today."
+                )
+            elif score_value >= 0:
+                st.info(
+                    "This record's historical score is below 75. "
+                    "The score is for comparison, not a live risk rating."
+                )
+
+            if st.button("Clear selected complaint"):
+                st.session_state.pop("selected_map_record_id", None)
+                st.rerun()
+        else:
+            st.info("Select a point on the map to see its complaint details here.")
+    else:
+        st.info("No valid coordinates match the current filters.")
 
     left, right = st.columns(2)
 
     with left:
+        st.subheader("Most common complaint categories")
         category_counts = (
             historical["category_title"]
             .value_counts()
+            .head(10)
+            .sort_values()
             .rename_axis("Category")
             .reset_index(name="Complaints")
         )
 
         if not category_counts.empty:
-            fig = px.bar(
-                category_counts.head(12).sort_values("Complaints"),
+            figure = px.bar(
+                category_counts,
                 x="Complaints",
                 y="Category",
                 orientation="h",
-                title="Most represented categories",
+                labels={"Complaints": "Number of complaints", "Category": ""},
+                color_discrete_sequence=["#0719b8"],
             )
-            fig.update_layout(yaxis_title="")
-            st.plotly_chart(fig, use_container_width=True)
+            figure.update_layout(
+                height=380,
+                margin=dict(l=10, r=15, t=15, b=10),
+                showlegend=False,
+            )
+            st.plotly_chart(figure, use_container_width=True)
+        else:
+            st.info("No category data matches these filters.")
 
     with right:
+        st.subheader("Recorded complaint statuses")
         status_counts = (
             historical["complaint_status_title"]
             .value_counts()
@@ -296,56 +561,111 @@ with overview_tab:
         )
 
         if not status_counts.empty:
-            fig = px.pie(
+            figure = px.pie(
                 status_counts,
                 names="Status",
                 values="Complaints",
-                hole=0.45,
-                title="Historical complaint statuses",
+                hole=0.55,
+                color_discrete_sequence=[
+                    "#0719b8",
+                    "#4f67e8",
+                    "#8b9aff",
+                    "#c2caff",
+                    "#e3e7ff",
+                ],
             )
-            st.plotly_chart(fig, use_container_width=True)
+            figure.update_layout(
+                height=380,
+                margin=dict(l=10, r=10, t=15, b=10),
+                legend_title_text="",
+            )
+            st.plotly_chart(figure, use_container_width=True)
+        else:
+            st.info("No status data matches these filters.")
 
+    st.subheader("Highest-ranked complaints")
+    top_columns = available_columns(
+        historical,
+        [
+            "priority_rank",
+            "record_id",
+            "title",
+            "category_title",
+            "ward_title",
+            "complaint_status_title",
+            "priority_score",
+        ],
+    )
+    top = historical.sort_values(
+        "priority_score", ascending=False, na_position="last"
+    ).head(12)
 
-with historical_tab:
-    st.markdown("### Historical complaint ranking")
+    if not top.empty and top_columns:
+        st.dataframe(
+            top[top_columns],
+            use_container_width=True,
+            hide_index=True,
+            height=380,
+            column_config={
+                "priority_score": st.column_config.NumberColumn(
+                    "Historical score", format="%.2f / 100"
+                ),
+                "priority_rank": st.column_config.NumberColumn("Rank", format="%d"),
+                "title": st.column_config.TextColumn("Complaint", width="large"),
+            },
+        )
 
-    search_text = st.text_input(
-        "Search historical records",
-        placeholder="Title, category, subcategory, ward or location",
+    st.download_button(
+        "Download records in this view",
+        data=historical.to_csv(index=False).encode("utf-8-sig"),
+        file_name="civicpriority_historical_records.csv",
+        mime="text/csv",
     )
 
-    view = historical.copy()
 
-    if search_text.strip():
-        search_columns = [
-            col
-            for col in [
-                "title",
-                "sub_category_title",
-                "category_title",
-                "ward_title",
-                "location",
-                "address",
-            ]
-            if col in view.columns
-        ]
+with records_tab:
+    st.subheader("Explore complaints")
+    st.write(
+        "Search historical records, review what was reported, and download the results."
+    )
 
-        match = pd.Series(False, index=view.index)
+    search_text = st.text_input(
+        "Search complaints",
+        placeholder="Try a title, category, ward, location, or record ID",
+    )
 
-        for col in search_columns:
-            match |= view[col].fillna("").astype(str).str.contains(
-                search_text,
-                case=False,
-                regex=False,
+    records_view = historical.copy()
+    searchable_columns = available_columns(
+        records_view,
+        [
+            "record_id",
+            "title",
+            "description",
+            "category_title",
+            "sub_category_title",
+            "ward_title",
+            "location",
+            "address",
+            "complaint_status_title",
+        ],
+    )
+
+    if search_text.strip() and searchable_columns:
+        matched = pd.Series(False, index=records_view.index)
+        for column in searchable_columns:
+            matched |= records_view[column].fillna("").astype(str).str.contains(
+                search_text.strip(), case=False, regex=False
             )
+        records_view = records_view[matched]
 
-        view = view[match]
+    records_view = records_view.sort_values(
+        "priority_score", ascending=False, na_position="last"
+    )
+    st.caption(f"{len(records_view):,} matching records")
 
-    view = view.sort_values("priority_score", ascending=False)
-
-    columns = [
-        col
-        for col in [
+    display_columns = available_columns(
+        records_view,
+        [
             "priority_rank",
             "record_id",
             "title",
@@ -353,417 +673,81 @@ with historical_tab:
             "sub_category_title",
             "ward_title",
             "complaint_status_title",
+            "created_at",
             "priority_score",
             "priority_explanation",
-        ]
-        if col in view.columns
-    ]
-
-    st.dataframe(
-        view[columns],
-        use_container_width=True,
-        hide_index=True,
-        height=450,
-    )
-
-    st.download_button(
-        "Download filtered historical records",
-        data=view.to_csv(index=False).encode("utf-8-sig"),
-        file_name="civicpriority_historical_records.csv",
-        mime="text/csv",
-    )
-
-
-with scoring_tab:
-    st.markdown("### Six-factor priority scoring engine")
-
-    st.warning(
-        "This view uses the illustrative sample dataset. Severity, "
-        "population, duration, geographic importance and resource values "
-        "are not verified measurements from the Bengaluru records."
-    )
-
-    st.markdown("#### Model weights")
-
-    weight_columns = st.columns(3)
-    adjusted_weights = {}
-
-    for index, (factor, (label, default)) in enumerate(ALL_FACTORS.items()):
-        with weight_columns[index % 3]:
-            adjusted_weights[factor] = st.number_input(
-                f"{label} weight (%)",
-                min_value=0,
-                max_value=100,
-                value=default,
-                step=5,
-                key=f"factor_weight_{factor}",
-            )
-
-    weight_total = sum(adjusted_weights.values())
-    urgency_weight_total = sum(
-        adjusted_weights[factor] for factor in URGENCY_FACTORS
-    )
-
-    if weight_total != 100:
-        st.warning(
-            f"Your weights total {weight_total}%. They will be "
-            "normalized proportionally for this scenario."
-        )
-
-    if weight_total == 0:
-        st.error("At least one factor must have a non-zero weight.")
-        st.stop()
-
-    scenario = apply_scenario_weights(sample_df, adjusted_weights)
-
-    c1, c2, c3 = st.columns(3)
-
-    c1.metric("Issues scored", len(scenario))
-    c2.metric(
-        "Mean urgency",
-        f"{scenario['urgency_score'].mean():.2f}/100",
-    )
-    c3.metric(
-        "Mean overall priority",
-        f"{scenario['priority_score'].mean():.2f}/100",
-    )
-
-    chosen_id = st.selectbox(
-        "Inspect an issue",
-        scenario["issue_id"].astype(str).tolist(),
-        key="scoring_issue",
-    )
-
-    selected = scenario[
-        scenario["issue_id"].astype(str) == chosen_id
-    ].iloc[0]
-
-    selected_col1, selected_col2 = st.columns(2)
-
-    selected_col1.metric(
-        "Overall priority score",
-        f"{selected['priority_score']:.2f}/100",
-    )
-    selected_col2.metric(
-        "Urgency score",
-        f"{selected['urgency_score']:.2f}/100",
-    )
-
-    contribution_rows = []
-
-    for factor, (label, _) in ALL_FACTORS.items():
-        contribution_rows.append(
-            {
-                "Factor": label,
-                "Normalized factor score": round(float(selected[factor]), 2),
-                "Weight (%)": adjusted_weights[factor],
-                "Weighted contribution": round(
-                    float(selected[factor])
-                    * adjusted_weights[factor]
-                    / weight_total,
-                    2,
-                ),
-            }
-        )
-
-    contribution_df = pd.DataFrame(contribution_rows)
-
-    st.markdown("#### Factor contributions")
-    st.dataframe(
-        contribution_df,
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    fig = px.bar(
-        contribution_df.sort_values("Weighted contribution"),
-        x="Weighted contribution",
-        y="Factor",
-        orientation="h",
-        title="Contribution to this scenario's overall score",
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown("#### Ranked sample issues")
-
-    ranked_columns = [
-        col
-        for col in [
-            "priority_rank",
-            "issue_id",
-            "issue_type",
             "location",
-            "urgency_score",
-            RESOURCE_FACTOR,
-            "priority_score",
-            "estimated_cost",
-        ]
-        if col in scenario.columns
-    ]
+        ],
+    )
 
     st.dataframe(
-        scenario[ranked_columns],
+        records_view[display_columns],
         use_container_width=True,
         hide_index=True,
+        height=520,
+        column_config={
+            "priority_score": st.column_config.NumberColumn(
+                "Historical score", format="%.2f"
+            ),
+            "created_at": st.column_config.DatetimeColumn(
+                "Recorded date", format="D MMM YYYY"
+            ),
+            "title": st.column_config.TextColumn("Complaint", width="large"),
+            "priority_explanation": st.column_config.TextColumn(
+                "Why it ranked here", width="large"
+            ),
+        },
     )
 
     st.download_button(
-        "Download six-factor scores",
-        data=scenario.to_csv(index=False).encode("utf-8-sig"),
-        file_name="civicpriority_six_factor_scores.csv",
+        "Download search results",
+        data=records_view.to_csv(index=False).encode("utf-8-sig"),
+        file_name="civicpriority_complaint_search.csv",
         mime="text/csv",
     )
 
 
-with planner_tab:
-    st.markdown("### Resource-aware intervention planner")
+with about_tab:
+    st.subheader("About this information")
 
-    st.warning(
-        "Illustrative mode: costs, crews and equipment come from the "
-        "sample dataset, not verified municipal estimates."
-    )
-
-    budget_col, crew_col, equipment_col = st.columns(3)
-
-    with budget_col:
-        budget = st.number_input(
-            "Available budget (₹)",
-            min_value=0,
-            max_value=1000000000,
-            value=65000,
-            step=5000,
-        )
-
-    with crew_col:
-        crews = st.number_input(
-            "Available crews",
-            min_value=0,
-            max_value=1000,
-            value=6,
-            step=1,
-        )
-
-    with equipment_col:
-        equipment = st.number_input(
-            "Available equipment units",
-            min_value=0,
-            max_value=1000,
-            value=4,
-            step=1,
-        )
-
-    if st.button("Recalculate intervention plan", type="primary"):
-        st.session_state["plan_budget"] = int(budget)
-        st.session_state["plan_crews"] = int(crews)
-        st.session_state["plan_equipment"] = int(equipment)
-
-    plan_budget = st.session_state.get("plan_budget", int(budget))
-    plan_crews = st.session_state.get("plan_crews", int(crews))
-    plan_equipment = st.session_state.get(
-        "plan_equipment", int(equipment)
-    )
-
-    planning_data = scenario.copy()
-
-    plan = plan_interventions(
-        ranked_issues=planning_data,
-        budget=plan_budget,
-        available_crews=plan_crews,
-        available_equipment=plan_equipment,
-    )
-
-    selected_plan = plan[
-        plan["selected_for_intervention"].astype(bool)
-    ].copy()
-
-    deferred_plan = plan[
-        ~plan["selected_for_intervention"].astype(bool)
-    ].copy()
-
-    budget_used = float(selected_plan["estimated_cost"].sum())
-    crews_used = int(selected_plan["crew_required"].sum())
-    equipment_used = int(selected_plan["equipment_required"].sum())
-
-    m1, m2, m3, m4 = st.columns(4)
-
-    m1.metric("Selected", len(selected_plan))
-    m2.metric("Deferred", len(deferred_plan))
-    m3.metric("Budget used", f"₹{budget_used:,.0f}")
-    m4.metric(
-        "Budget remaining",
-        f"₹{max(0, plan_budget - budget_used):,.0f}",
-    )
-
-    r1, r2 = st.columns(2)
-
-    with r1:
-        st.write(f"Crews used: **{crews_used} / {plan_crews}**")
-        st.progress(
-            min(1.0, crews_used / plan_crews)
-            if plan_crews > 0
-            else 0.0
-        )
-
-    with r2:
-        st.write(
-            f"Equipment used: **{equipment_used} / {plan_equipment}**"
-        )
-        st.progress(
-            min(1.0, equipment_used / plan_equipment)
-            if plan_equipment > 0
-            else 0.0
-        )
-
-    planner_columns = [
-        col
-        for col in [
-            "issue_id",
-            "issue_type",
-            "location",
-            "urgency_score",
-            "priority_score",
-            "priority_rank",
-            "estimated_cost",
-            "crew_required",
-            "equipment_required",
-            "planning_status",
-        ]
-        if col in plan.columns
-    ]
-
-    selected_tab, deferred_tab = st.tabs(
-        ["Selected interventions", "Deferred interventions"]
-    )
-
-    with selected_tab:
-        st.dataframe(
-            selected_plan[planner_columns],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    with deferred_tab:
-        st.dataframe(
-            deferred_plan[planner_columns],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-    explanations = []
-
-    for _, row in plan.iterrows():
-        explanations.append(
-            {
-                "Issue": row["issue_id"],
-                "Decision": (
-                    "Selected"
-                    if bool(row["selected_for_intervention"])
-                    else "Deferred"
-                ),
-                "Explanation": explain_scenario_priority(
-                    row, adjusted_weights
-                ),
-                "Planning reason": row["planning_status"],
-            }
-        )
-
-    st.markdown("#### Decision explanations")
-    st.dataframe(
-        pd.DataFrame(explanations),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.download_button(
-        "Download intervention plan",
-        data=plan.to_csv(index=False).encode("utf-8-sig"),
-        file_name="civicpriority_intervention_plan.csv",
-        mime="text/csv",
-    )
-
-
-with map_tab:
-    st.markdown("### Geographic distribution")
-
-    if {"latitude", "longitude"}.issubset(historical.columns):
-        map_df = historical.dropna(
-            subset=["latitude", "longitude"]
-        ).copy()
-
-        map_df = map_df[
-            map_df["latitude"].between(-90, 90)
-            & map_df["longitude"].between(-180, 180)
-        ]
-
-        if not map_df.empty:
-            st.caption(
-                "Locations represent recorded complaint coordinates."
-            )
-
-            st.map(
-                map_df.rename(
-                    columns={
-                        "latitude": "lat",
-                        "longitude": "lon",
-                    }
-                )[["lat", "lon"]]
-            )
-
-            st.write(f"Mapped records: {len(map_df):,}")
-        else:
-            st.info("No valid coordinates match the current filters.")
-    else:
-        st.info("Coordinates are unavailable in the historical dataset.")
-
-
-with methodology_tab:
-    st.markdown("### Data provenance and model limitations")
-
+    st.markdown("#### Where does the data come from?")
     st.write(
-        "**Historical dataset:** Bengaluru complaint records spanning "
-        "2019–2022, analyzed using historical review signals."
+        "This dashboard presents historical Bengaluru civic complaint records from 2019–2022. "
+        "The status and location are the values recorded in the source dataset."
     )
 
+    st.markdown("#### What does the historical score mean?")
     st.write(
-        "**Six-factor scoring:** demonstrated on a separate illustrative "
-        "sample dataset. Weights are user-adjustable and are not calibrated "
-        "against verified outcomes."
+        "The score is a rule-based ranking using recurrence, recorded status, age of the record, "
+        "and ward-level complaint concentration. A higher score means the record ranked higher "
+        "under that method. It is not a prediction of future incidents or a confirmation of current urgency."
     )
 
+    st.markdown("#### What should I do with a high score?")
     st.write(
-        "**Urgency score:** combines severity, population affected, "
-        "recurrence, duration and geographic context using the selected "
-        "relative weights for those five factors."
+        "Use it to identify records worth reviewing. Confirm the location and whether the issue "
+        "still exists before using the record to guide real-world decisions."
     )
 
-    st.write(
-        "**Overall priority score:** combines all six factors using the "
-        "selected weights normalized by their total."
-    )
+    st.markdown("#### Data coverage")
+    coordinate_count = 0
+    if {"latitude", "longitude"}.issubset(real_df.columns):
+        latitude = pd.to_numeric(real_df["latitude"], errors="coerce")
+        longitude = pd.to_numeric(real_df["longitude"], errors="coerce")
+        coordinate_count = int(
+            (
+                latitude.between(-90, 90)
+                & longitude.between(-180, 180)
+            ).fillna(False).sum()
+        )
 
-    st.write(
-        "**Resource feasibility:** uses a provisional inverse-scale score "
-        "derived from estimated cost, crew requirements and equipment "
-        "requirements. Lower resource burden generally gives a higher "
-        "feasibility score."
-    )
-
-    st.write(
-        "**Planning:** selects a feasible combination under budget, crew "
-        "and equipment limits. It does not schedule work over time or "
-        "model crew skills, travel time, dependencies or emergencies."
-    )
-
-    st.write(
-        "**Known data gaps:** verified severity, affected population, "
-        "current status, repair cost, crew requirements, equipment "
-        "requirements and validated emergency labels."
-    )
+    metric1, metric2, metric3 = st.columns(3)
+    metric1.metric("Historical records", fmt_count(len(real_df)))
+    metric2.metric("Records with valid coordinates", fmt_count(coordinate_count))
+    metric3.metric("Categories", fmt_count(real_df["category_title"].nunique()))
 
 
 st.divider()
-
 st.caption(
-    "CivicPriority | Explainable infrastructure decision support | "
-    "Prototype, not a live emergency-response system"
+    "CivicPriority · Historical civic intelligence · Not a live emergency-response service"
 )
